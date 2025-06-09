@@ -498,13 +498,19 @@ def generate_single(client, prompt, model, size, quality):
     """Generate a single image with retry logic"""
     for attempt in range(Config.RETRY_ATTEMPTS):
         try:
-            response = client.images.generate(
-                model=model,
-                prompt=prompt,
-                size=size,
-                quality=quality,
-                n=1
-            )
+            # Build parameters based on model
+            params = {
+                "model": model,
+                "prompt": prompt,
+                "size": size,
+                "n": 1
+            }
+            
+            # Only add quality for DALL-E 3
+            if model == "dall-e-3":
+                params["quality"] = quality
+            
+            response = client.images.generate(**params)
             
             # Save image
             save_dir = Path.home() / ".dalle2_cli" / "images"
