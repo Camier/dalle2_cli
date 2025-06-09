@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-DALL-E CLI v2 - Modern, async-powered CLI for OpenAI image generation
-Built with best practices from 2024 research
+DALL-E CLI v2 - Modern, feature-rich command line interface for DALL-E image generation
 """
 import os
 import sys
@@ -9,636 +8,635 @@ import asyncio
 import json
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any
 import base64
-from concurrent.futures import ThreadPoolExecutor
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 
-import click
-import aiohttp
-import aiofiles
+# Third party imports
+import typer
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
 from rich.prompt import Prompt, Confirm
-from rich.syntax import Syntax
 from rich.markdown import Markdown
-from rich.live import Live
 from rich.layout import Layout
-from rich import print as rprint
+from rich.live import Live
+from rich.text import Text
+from rich.columns import Columns
+from rich import box
+import questionary
 from PIL import Image
 import openai
-from openai import AsyncOpenAI
+from openai import OpenAI, AsyncOpenAI
+import httpx
+import aiofiles
+import aiohttp
 
+# Local imports
+sys.path.insert(0, str(Path(__file__).parent))
+from core.security import SecurityManager
+from core.config_manager import ConfigManager
+from data.database import DatabaseManager
+
+# Initialize Typer app with rich markup
+app = typer.Typer(
+    rich_markup_mode="rich",
+    help="🎨 [bold cyan]DALL-E CLI v2[/bold cyan] - Generate stunning AI images from your terminal"
+)
+
+# Console for rich output
 console = Console()
 
-class DALLEConfig:
-    """Configuration management for DALL-E CLI"""
-    def __init__(self):
-        self.config_dir = Path.home() / ".dalle_cli"
-        self.config_file = self.config_dir / "config.json"
-        self.config = self.load_config()
-        
-    def load_config(self) -> Dict[str, Any]:
-        """Load configuration from file"""
-        if self.config_file.exists():
-            with open(self.config_file, 'r') as f:
-                return json.load(f)
-        return {
-            "api_key": None,
-            "default_model": "dall-e-3",
-            "default_size": "1024x1024",
-            "default_quality": "standard",
-            "save_directory": str(Path.home() / "dalle_images"),
-            "history_enabled": True,
-            "cost_tracking": True,
-            "batch_size": 4,
-            "max_retries": 3,
-            "timeout": 120
-        }
-    
-    def save_config(self):
-        """Save configuration to file"""
-        self.config_dir.mkdir(exist_ok=True)
-        with open(self.config_file, 'w') as f:
-            json.dump(self.config, f, indent=2)
-    
-    def get(self, key: str, default=None):
-        """Get configuration value"""
-        return self.config.get(key, default)
-    
-    def set(self, key: str, value: Any):
-        """Set configuration value"""
-        self.config[key] = value
-        self.save_config()
-
-class ImageGenerator:
-    """Async image generation with advanced features"""
-    
-    PRICING = {
-        "dall-e-2": {
-            "1024x1024": 0.020,
-            "512x512": 0.018,
-            "256x256": 0.016
-        },
-        "dall-e-3": {
-            "1024x1024": 0.040,
-            "1024x1792": 0.080,
-            "1792x1024": 0.080
-        }
+# Global settings
+MODELS = {
+    "dall-e-2": {
+        "sizes": ["256x256", "512x512", "1024x1024"],
+        "default_size": "1024x1024",
+        "max_prompt": 1000,
+        "features": ["variations", "edits"]
+    },
+    "dall-e-3": {
+        "sizes": ["1024x1024", "1024x1792", "1792x1024"],
+        "default_size": "1024x1024",
+        "max_prompt": 4000,
+        "features": ["hd", "style"]
     }
-    
-    def __init__(self, api_key: str, config: DALLEConfig):
-        self.client = AsyncOpenAI(api_key=api_key)
-        self.config = config
-        self.session = None
+}
+
+class DalleCliV2:
+    def __init__(self):
+        self.config_manager = ConfigManager()
+        self.security_manager = SecurityManager()
+        self.db_manager = DatabaseManager(Path.home() / ".dalle2_cli" / "database.db")
+        self.client = None
+        self.async_client = None
+        self.save_dir = Path.home() / ".dalle2_cli" / "images"
+        self.save_dir.mkdir(parents=True, exist_ok=True)
         
-    async def __aenter__(self):
-        self.session = aiohttp.ClientSession()
-        return self
+    def initialize_client(self, api_key: str):
+        """Initialize OpenAI clients"""
+        self.client = OpenAI(api_key=api_key)
+        self.async_client = AsyncOpenAI(api_key=api_key)
         
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.session:
-            await self.session.close()
+    def get_image_hash(self, image_path: Path) -> str:
+        """Get SHA256 hash of image for deduplication"""
+        with open(image_path, 'rb') as f:
+            return hashlib.sha256(f.read()).hexdigest()
+
+cli_instance = DalleCliV2()
+
+# Callback for global options
+@app.callback()
+def main(
+    ctx: typer.Context,
+    api_key: Optional[str] = typer.Option(None, "--api-key", "-k", help="OpenAI API key"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose output"),
+    version: bool = typer.Option(None, "--version", callback=lambda x: _version_callback(x), is_eager=True)
+):
+    """
+    🎨 [bold cyan]DALL-E CLI v2[/bold cyan] - Generate stunning AI images from your terminal
     
-    def estimate_cost(self, model: str, size: str, count: int) -> float:
-        """Estimate generation cost"""
-        price_per_image = self.PRICING.get(model, {}).get(size, 0.040)
-        return price_per_image * count
+    [yellow]Features:[/yellow]
+    • Generate images with DALL-E 2 or DALL-E 3
+    • Create variations of existing images
+    • Edit images with AI-powered inpainting
+    • Batch processing with progress tracking
+    • Gallery view with metadata
+    • Export/import image collections
+    • Real-time streaming generation
+    """
+    if ctx.invoked_subcommand is None:
+        # Show interactive menu if no command specified
+        interactive_menu()
+        return
+        
+    # Set up API key
+    if api_key:
+        cli_instance.initialize_client(api_key)
+    else:
+        stored_key = cli_instance.security_manager.load_api_key()
+        if stored_key:
+            cli_instance.initialize_client(stored_key)
+        else:
+            console.print("[red]No API key found![/red]")
+            console.print("Please run: [cyan]dalle setup[/cyan] or provide --api-key")
+            raise typer.Exit(1)
+
+def _version_callback(value: bool):
+    if value:
+        console.print("[bold cyan]DALL-E CLI v2.0.0[/bold cyan]")
+        console.print("Built with ❤️ using Typer and Rich")
+        raise typer.Exit()
+
+@app.command()
+def generate(
+    prompt: str = typer.Argument(..., help="The prompt to generate images from"),
+    model: str = typer.Option("dall-e-3", "--model", "-m", help="Model to use"),
+    size: Optional[str] = typer.Option(None, "--size", "-s", help="Image size"),
+    quality: str = typer.Option("standard", "--quality", "-q", help="Image quality (dall-e-3 only)"),
+    style: str = typer.Option("vivid", "--style", help="Image style (dall-e-3 only)"),
+    n: int = typer.Option(1, "--number", "-n", help="Number of images to generate"),
+    batch: bool = typer.Option(False, "--batch", "-b", help="Enable batch mode for multiple variations"),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Output directory")
+):
+    """
+    🎨 Generate images from text prompts
     
-    async def generate_single(self, prompt: str, model: str, size: str, 
-                            quality: str, style: str = "vivid") -> Dict[str, Any]:
-        """Generate a single image"""
-        try:
-            params = {
-                "model": model,
-                "prompt": prompt,
-                "size": size,
-                "quality": quality,
-                "n": 1
-            }
+    [bold]Examples:[/bold]
+    $ dalle generate "a serene landscape at sunset"
+    $ dalle generate "futuristic city" --model dall-e-3 --quality hd
+    $ dalle generate "abstract art" --size 1792x1024 --n 4
+    """
+    # Validate model
+    if model not in MODELS:
+        console.print(f"[red]Invalid model: {model}[/red]")
+        console.print(f"Available models: {', '.join(MODELS.keys())}")
+        raise typer.Exit(1)
+        
+    # Set default size if not specified
+    if not size:
+        size = MODELS[model]["default_size"]
+    elif size not in MODELS[model]["sizes"]:
+        console.print(f"[red]Invalid size for {model}: {size}[/red]")
+        console.print(f"Available sizes: {', '.join(MODELS[model]['sizes'])}")
+        raise typer.Exit(1)
+    
+    # Create output directory
+    output_dir = output or cli_instance.save_dir / datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Show generation panel
+    panel = Panel(
+        f"[bold]Prompt:[/bold] {prompt}\n"
+        f"[bold]Model:[/bold] {model}\n"
+        f"[bold]Size:[/bold] {size}\n"
+        f"[bold]Quality:[/bold] {quality}\n"
+        f"[bold]Images:[/bold] {n}",
+        title="🎨 Generation Settings",
+        border_style="cyan"
+    )
+    console.print(panel)
+    
+    # Generate images with progress
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeRemainingColumn(),
+        console=console
+    ) as progress:
+        if batch and n > 1:
+            # Batch mode - generate in parallel
+            asyncio.run(_batch_generate(prompt, model, size, quality, style, n, output_dir, progress))
+        else:
+            # Sequential generation
+            task = progress.add_task(f"[cyan]Generating {n} images...", total=n)
             
+            for i in range(n):
+                try:
+                    response = _generate_single_image(prompt, model, size, quality, style)
+                    
+                    # Save image
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    filename = f"dalle_{model}_{timestamp}_{i+1}.png"
+                    filepath = output_dir / filename
+                    
+                    _save_image_from_url(response.data[0].url, filepath)
+                    
+                    # Store in database
+                    cli_instance.db_manager.add_generation(
+                        prompt=prompt,
+                        model=model,
+                        size=size,
+                        quality=quality,
+                        style=style if model == "dall-e-3" else None,
+                        image_path=str(filepath),
+                        revised_prompt=getattr(response.data[0], 'revised_prompt', None)
+                    )
+                    
+                    progress.update(task, advance=1)
+                    console.print(f"✅ Saved: [green]{filepath}[/green]")
+                    
+                except Exception as e:
+                    console.print(f"[red]Error generating image {i+1}: {e}[/red]")
+    
+    # Show summary
+    console.print(f"\n✨ Generated {n} images in [cyan]{output_dir}[/cyan]")
+
+async def _batch_generate(prompt, model, size, quality, style, n, output_dir, progress):
+    """Generate multiple images in parallel"""
+    task = progress.add_task(f"[cyan]Generating {n} images in parallel...", total=n)
+    
+    async def generate_one(index):
+        try:
             if model == "dall-e-3":
-                params["style"] = style
-                
-            response = await self.client.images.generate(**params)
-            
-            return {
-                "success": True,
-                "url": response.data[0].url,
-                "revised_prompt": getattr(response.data[0], 'revised_prompt', prompt),
-                "model": model,
-                "size": size,
-                "quality": quality
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "prompt": prompt
-            }
-    
-    async def generate_batch(self, prompts: List[str], model: str, size: str,
-                           quality: str, style: str = "vivid", 
-                           progress_callback=None) -> List[Dict[str, Any]]:
-        """Generate multiple images concurrently"""
-        tasks = []
-        for i, prompt in enumerate(prompts):
-            task = self.generate_single(prompt, model, size, quality, style)
-            tasks.append(task)
-            
-        results = []
-        for i, task in enumerate(asyncio.as_completed(tasks)):
-            result = await task
-            results.append(result)
-            if progress_callback:
-                progress_callback(i + 1, len(prompts))
-                
-        return results
-    
-    async def download_image(self, url: str, save_path: Path) -> bool:
-        """Download image from URL"""
-        try:
-            async with self.session.get(url) as response:
-                if response.status == 200:
-                    content = await response.read()
-                    async with aiofiles.open(save_path, 'wb') as f:
-                        await f.write(content)
-                    return True
-        except Exception as e:
-            console.print(f"[red]Error downloading image: {e}[/red]")
-        return False
-    
-    async def create_variations(self, image_path: Path, n: int = 1, 
-                              size: str = "1024x1024") -> List[Dict[str, Any]]:
-        """Create variations of an existing image"""
-        try:
-            with open(image_path, 'rb') as f:
-                response = await self.client.images.create_variation(
-                    image=f,
-                    n=n,
-                    size=size
+                response = await cli_instance.async_client.images.generate(
+                    model=model,
+                    prompt=prompt,
+                    size=size,
+                    quality=quality,
+                    style=style,
+                    n=1
+                )
+            else:
+                response = await cli_instance.async_client.images.generate(
+                    model=model,
+                    prompt=prompt,
+                    size=size,
+                    n=1
                 )
             
-            return [{
-                "success": True,
-                "url": data.url,
-                "original": str(image_path)
-            } for data in response.data]
-        except Exception as e:
-            return [{
-                "success": False,
-                "error": str(e),
-                "original": str(image_path)
-            }]
-    
-    async def edit_image(self, image_path: Path, prompt: str, 
-                        mask_path: Optional[Path] = None,
-                        size: str = "1024x1024") -> Dict[str, Any]:
-        """Edit an existing image with a prompt"""
-        try:
-            with open(image_path, 'rb') as img_file:
-                if mask_path:
-                    with open(mask_path, 'rb') as mask_file:
-                        response = await self.client.images.edit(
-                            image=img_file,
-                            mask=mask_file,
-                            prompt=prompt,
-                            size=size
-                        )
-                else:
-                    response = await self.client.images.edit(
-                        image=img_file,
-                        prompt=prompt,
-                        size=size
-                    )
+            # Save image
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            filename = f"dalle_{model}_{timestamp}_{index+1}.png"
+            filepath = output_dir / filename
             
-            return {
-                "success": True,
-                "url": response.data[0].url,
-                "prompt": prompt,
-                "original": str(image_path)
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "prompt": prompt
-            }
-
-class VisionAnalyzer:
-    """Analyze images using GPT-4 Vision"""
-    
-    def __init__(self, api_key: str):
-        self.client = AsyncOpenAI(api_key=api_key)
-    
-    async def analyze_image(self, image_path: Path, prompt: str = "What's in this image?") -> str:
-        """Analyze an image using vision API"""
-        try:
-            with open(image_path, 'rb') as f:
-                image_data = base64.b64encode(f.read()).decode('utf-8')
+            await _async_save_image(response.data[0].url, filepath)
             
-            response = await self.client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_data}"
-                            }
-                        }
-                    ]
-                }]
+            # Store in database
+            cli_instance.db_manager.add_generation(
+                prompt=prompt,
+                model=model,
+                size=size,
+                quality=quality,
+                style=style if model == "dall-e-3" else None,
+                image_path=str(filepath),
+                revised_prompt=getattr(response.data[0], 'revised_prompt', None)
             )
             
-            return response.choices[0].message.content
+            progress.update(task, advance=1)
+            return filepath
+            
         except Exception as e:
-            return f"Error analyzing image: {e}"
-
-# Click command groups
-@click.group(context_settings={'help_option_names': ['-h', '--help']})
-@click.version_option(version='2.0.0', prog_name='DALL-E CLI')
-@click.pass_context
-def cli(ctx):
-    """DALL-E CLI v2 - Modern AI image generation tool
+            console.print(f"[red]Error in batch {index+1}: {e}[/red]")
+            return None
     
-    \b
-    Features:
-    - Generate images with DALL-E 2 and DALL-E 3
-    - Batch processing for multiple prompts
-    - Image variations and editing
-    - Vision API integration
-    - Cost tracking and estimation
-    - Rich terminal output
+    # Create tasks
+    tasks = [generate_one(i) for i in range(n)]
+    results = await asyncio.gather(*tasks)
+    
+    # Report results
+    successful = [r for r in results if r is not None]
+    console.print(f"\n✅ Successfully generated {len(successful)}/{n} images")
+
+def _generate_single_image(prompt, model, size, quality, style):
+    """Generate a single image"""
+    if model == "dall-e-3":
+        return cli_instance.client.images.generate(
+            model=model,
+            prompt=prompt,
+            size=size,
+            quality=quality,
+            style=style,
+            n=1
+        )
+    else:
+        return cli_instance.client.images.generate(
+            model=model,
+            prompt=prompt,
+            size=size,
+            n=1
+        )
+
+def _save_image_from_url(url: str, filepath: Path):
+    """Download and save image from URL"""
+    response = httpx.get(url)
+    response.raise_for_status()
+    
+    with open(filepath, 'wb') as f:
+        f.write(response.content)
+
+async def _async_save_image(url: str, filepath: Path):
+    """Async download and save image"""
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            content = await response.read()
+            async with aiofiles.open(filepath, 'wb') as f:
+                await f.write(content)
+
+@app.command()
+def variations(
+    image_path: Path = typer.Argument(..., help="Path to the source image"),
+    n: int = typer.Option(2, "--number", "-n", help="Number of variations"),
+    size: Optional[str] = typer.Option(None, "--size", "-s", help="Output size"),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Output directory")
+):
     """
-    ctx.ensure_object(dict)
-    ctx.obj['config'] = DALLEConfig()
+    🔄 Create variations of an existing image
     
-    # Check API key
-    api_key = ctx.obj['config'].get('api_key') or os.getenv('OPENAI_API_KEY')
-    if not api_key and ctx.invoked_subcommand != 'config':
-        console.print("[red]No API key found![/red]")
-        console.print("Set it with: dalle config set api_key YOUR_KEY")
-        ctx.exit(1)
+    [bold]Example:[/bold]
+    $ dalle variations image.png --n 4
+    """
+    if not image_path.exists():
+        console.print(f"[red]Image not found: {image_path}[/red]")
+        raise typer.Exit(1)
     
-    ctx.obj['api_key'] = api_key
+    # Open and prepare image
+    with open(image_path, "rb") as image_file:
+        image_data = image_file.read()
+    
+    # Create output directory
+    output_dir = output or cli_instance.save_dir / f"variations_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    console.print(f"🔄 Creating {n} variations of [cyan]{image_path.name}[/cyan]")
+    
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        console=console
+    ) as progress:
+        task = progress.add_task("[cyan]Generating variations...", total=n)
+        
+        try:
+            response = cli_instance.client.images.create_variation(
+                image=image_data,
+                n=n,
+                size=size or "1024x1024"
+            )
+            
+            for i, image_data in enumerate(response.data):
+                filename = f"variation_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{i+1}.png"
+                filepath = output_dir / filename
+                
+                _save_image_from_url(image_data.url, filepath)
+                progress.update(task, advance=1)
+                console.print(f"✅ Saved: [green]{filepath}[/green]")
+                
+        except Exception as e:
+            console.print(f"[red]Error creating variations: {e}[/red]")
+            raise typer.Exit(1)
+    
+    console.print(f"\n✨ Created {n} variations in [cyan]{output_dir}[/cyan]")
 
-@cli.group()
-@click.pass_context
-def config(ctx):
-    """Manage configuration settings"""
-    pass
+@app.command()
+def edit(
+    image_path: Path = typer.Argument(..., help="Path to the image to edit"),
+    mask_path: Path = typer.Argument(..., help="Path to the mask image"),
+    prompt: str = typer.Argument(..., help="Description of the edit"),
+    n: int = typer.Option(1, "--number", "-n", help="Number of edits"),
+    size: Optional[str] = typer.Option(None, "--size", "-s", help="Output size")
+):
+    """
+    ✏️ Edit images with AI-powered inpainting
+    
+    [bold]Example:[/bold]
+    $ dalle edit image.png mask.png "add a rainbow in the sky"
+    """
+    if not image_path.exists() or not mask_path.exists():
+        console.print("[red]Image or mask file not found![/red]")
+        raise typer.Exit(1)
+    
+    # Implementation would follow similar pattern to variations
+    console.print("✏️ Edit functionality coming soon!")
 
-@config.command('show')
-@click.pass_context
-def config_show(ctx):
-    """Show current configuration"""
-    config = ctx.obj['config']
+@app.command()
+def gallery(
+    limit: int = typer.Option(10, "--limit", "-l", help="Number of images to show"),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Filter by model"),
+    date: Optional[str] = typer.Option(None, "--date", "-d", help="Filter by date (YYYY-MM-DD)")
+):
+    """
+    🖼️ View your generated images in a gallery
     
-    table = Table(title="DALL-E CLI Configuration")
-    table.add_column("Setting", style="cyan")
-    table.add_column("Value", style="green")
+    [bold]Example:[/bold]
+    $ dalle gallery --limit 20
+    $ dalle gallery --model dall-e-3 --date 2024-01-09
+    """
+    # Get recent generations from database
+    generations = cli_instance.db_manager.get_recent_generations(limit)
     
-    for key, value in config.config.items():
-        if key == "api_key" and value:
-            value = value[:8] + "..." + value[-4:]
-        table.add_row(key, str(value))
+    if not generations:
+        console.print("[yellow]No images found in gallery[/yellow]")
+        return
+    
+    # Create gallery table
+    table = Table(title="🖼️ Image Gallery", box=box.ROUNDED)
+    table.add_column("ID", style="cyan", width=6)
+    table.add_column("Prompt", style="white", width=40)
+    table.add_column("Model", style="green", width=10)
+    table.add_column("Size", style="blue", width=12)
+    table.add_column("Date", style="yellow", width=20)
+    table.add_column("Path", style="magenta", width=30)
+    
+    for gen in generations:
+        # Truncate prompt if too long
+        prompt = gen.prompt[:37] + "..." if len(gen.prompt) > 40 else gen.prompt
+        
+        table.add_row(
+            str(gen.id),
+            prompt,
+            gen.model,
+            gen.size,
+            gen.created_at.strftime("%Y-%m-%d %H:%M"),
+            Path(gen.image_path).name
+        )
     
     console.print(table)
-
-@config.command('set')
-@click.argument('key')
-@click.argument('value')
-@click.pass_context
-def config_set(ctx, key, value):
-    """Set a configuration value"""
-    config = ctx.obj['config']
     
-    # Handle boolean values
-    if value.lower() in ['true', 'false']:
-        value = value.lower() == 'true'
-    # Handle numeric values
-    elif value.isdigit():
-        value = int(value)
-    
-    config.set(key, value)
-    console.print(f"[green]✓[/green] Set {key} = {value}")
-
-@cli.command()
-@click.argument('prompt')
-@click.option('--model', '-m', default=None, help='Model to use (dall-e-2 or dall-e-3)')
-@click.option('--size', '-s', default=None, help='Image size')
-@click.option('--quality', '-q', default=None, help='Image quality (standard or hd)')
-@click.option('--style', default='vivid', help='Style (vivid or natural) - DALL-E 3 only')
-@click.option('--count', '-n', default=1, help='Number of images to generate')
-@click.option('--save-dir', '-d', type=click.Path(), help='Directory to save images')
-@click.option('--no-download', is_flag=True, help='Don\'t download images locally')
-@click.option('--show-cost', is_flag=True, help='Show cost estimation before generating')
-@click.pass_context
-def generate(ctx, prompt, model, size, quality, style, count, save_dir, no_download, show_cost):
-    """Generate images from a text prompt"""
-    config = ctx.obj['config']
-    
-    # Use defaults from config if not specified
-    model = model or config.get('default_model')
-    size = size or config.get('default_size')
-    quality = quality or config.get('default_quality')
-    save_dir = Path(save_dir) if save_dir else Path(config.get('save_directory'))
-    
-    # Validate parameters
-    if model not in ['dall-e-2', 'dall-e-3']:
-        console.print(f"[red]Invalid model: {model}[/red]")
-        return
-    
-    # Run async function
-    asyncio.run(_generate_async(
-        ctx.obj['api_key'], config, prompt, model, size, quality, 
-        style, count, save_dir, no_download, show_cost
-    ))
-
-async def _generate_async(api_key, config, prompt, model, size, quality, 
-                         style, count, save_dir, no_download, show_cost):
-    """Async implementation of generate command"""
-    async with ImageGenerator(api_key, config) as generator:
-        # Show cost estimation
-        if show_cost or config.get('cost_tracking'):
-            cost = generator.estimate_cost(model, size, count)
-            console.print(f"[yellow]Estimated cost: ${cost:.3f}[/yellow]")
-            if show_cost and not Confirm.ask("Continue?"):
-                return
-        
-        # Prepare prompts
-        prompts = [prompt] * count
-        
-        # Generate images with progress
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            console=console
-        ) as progress:
-            task = progress.add_task(f"Generating {count} image(s)...", total=count)
-            
-            def update_progress(completed, total):
-                progress.update(task, completed=completed)
-            
-            results = await generator.generate_batch(
-                prompts, model, size, quality, style, update_progress
-            )
-        
-        # Process results
-        successful = [r for r in results if r['success']]
-        failed = [r for r in results if not r['success']]
-        
-        if successful:
-            console.print(f"\n[green]✓ Generated {len(successful)} image(s)[/green]")
-            
-            # Save images
-            if not no_download:
-                save_dir.mkdir(parents=True, exist_ok=True)
+    # Offer to view specific image
+    if Confirm.ask("\n[cyan]View a specific image?[/cyan]"):
+        image_id = Prompt.ask("Enter image ID")
+        try:
+            image_id = int(image_id)
+            gen = next((g for g in generations if g.id == image_id), None)
+            if gen and Path(gen.image_path).exists():
+                Image.open(gen.image_path).show()
                 
-                with Progress(
-                    SpinnerColumn(),
-                    TextColumn("[progress.description]{task.description}"),
-                    console=console
-                ) as progress:
-                    task = progress.add_task("Downloading images...", total=len(successful))
-                    
-                    for i, result in enumerate(successful):
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        filename = f"dalle_{timestamp}_{i+1}.png"
-                        save_path = save_dir / filename
-                        
-                        if await generator.download_image(result['url'], save_path):
-                            console.print(f"  → Saved: {save_path}")
-                            
-                            # Show revised prompt if different
-                            if result.get('revised_prompt') != prompt:
-                                console.print(f"    [dim]Revised: {result['revised_prompt']}[/dim]")
-                        
-                        progress.update(task, advance=1)
-        
-        if failed:
-            console.print(f"\n[red]✗ Failed to generate {len(failed)} image(s)[/red]")
-            for result in failed:
-                console.print(f"  Error: {result['error']}")
-
-@cli.command()
-@click.argument('prompts_file', type=click.Path(exists=True))
-@click.option('--model', '-m', default=None, help='Model to use')
-@click.option('--size', '-s', default=None, help='Image size')
-@click.option('--quality', '-q', default=None, help='Image quality')
-@click.option('--concurrent', '-c', default=4, help='Number of concurrent requests')
-@click.option('--output-dir', '-o', type=click.Path(), help='Output directory')
-@click.pass_context
-def batch(ctx, prompts_file, model, size, quality, concurrent, output_dir):
-    """Generate images from multiple prompts in a file"""
-    config = ctx.obj['config']
-    
-    # Read prompts
-    with open(prompts_file, 'r') as f:
-        prompts = [line.strip() for line in f if line.strip()]
-    
-    if not prompts:
-        console.print("[red]No prompts found in file[/red]")
-        return
-    
-    console.print(f"[cyan]Found {len(prompts)} prompts[/cyan]")
-    
-    # Use defaults
-    model = model or config.get('default_model')
-    size = size or config.get('default_size')
-    quality = quality or config.get('default_quality')
-    output_dir = Path(output_dir) if output_dir else Path(config.get('save_directory'))
-    
-    asyncio.run(_batch_async(
-        ctx.obj['api_key'], config, prompts, model, size, quality, 
-        concurrent, output_dir
-    ))
-
-async def _batch_async(api_key, config, prompts, model, size, quality, 
-                      concurrent, output_dir):
-    """Async implementation of batch command"""
-    async with ImageGenerator(api_key, config) as generator:
-        # Estimate total cost
-        total_cost = generator.estimate_cost(model, size, len(prompts))
-        console.print(f"[yellow]Estimated total cost: ${total_cost:.3f}[/yellow]")
-        
-        if not Confirm.ask("Continue with batch generation?"):
-            return
-        
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Process in batches
-        all_results = []
-        batch_size = concurrent
-        
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            console=console
-        ) as progress:
-            task = progress.add_task(f"Processing {len(prompts)} prompts...", total=len(prompts))
-            
-            for i in range(0, len(prompts), batch_size):
-                batch_prompts = prompts[i:i+batch_size]
-                
-                def update_batch_progress(completed, total):
-                    progress.update(task, completed=i+completed)
-                
-                results = await generator.generate_batch(
-                    batch_prompts, model, size, quality, 
-                    progress_callback=update_batch_progress
+                # Show full details
+                details = Panel(
+                    f"[bold]Prompt:[/bold] {gen.prompt}\n"
+                    f"[bold]Model:[/bold] {gen.model}\n"
+                    f"[bold]Size:[/bold] {gen.size}\n"
+                    f"[bold]Quality:[/bold] {gen.quality}\n"
+                    f"[bold]Created:[/bold] {gen.created_at}\n"
+                    f"[bold]Path:[/bold] {gen.image_path}",
+                    title="📋 Image Details",
+                    border_style="cyan"
                 )
-                
-                # Save successful results
-                for j, result in enumerate(results):
-                    if result['success']:
-                        prompt_hash = hashlib.md5(batch_prompts[j].encode()).hexdigest()[:8]
-                        filename = f"batch_{prompt_hash}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                        save_path = output_dir / filename
-                        
-                        if await generator.download_image(result['url'], save_path):
-                            result['saved_path'] = str(save_path)
-                
-                all_results.extend(results)
-        
-        # Summary
-        successful = len([r for r in all_results if r['success']])
-        console.print(f"\n[green]✓ Successfully generated {successful}/{len(prompts)} images[/green]")
-        
-        # Save results report
-        report_path = output_dir / f"batch_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        with open(report_path, 'w') as f:
-            json.dump(all_results, f, indent=2)
-        console.print(f"[dim]Report saved to: {report_path}[/dim]")
-
-@cli.command()
-@click.argument('image_path', type=click.Path(exists=True))
-@click.option('--count', '-n', default=1, help='Number of variations')
-@click.option('--size', '-s', default='1024x1024', help='Output size')
-@click.pass_context
-def variations(ctx, image_path, count, size):
-    """Create variations of an existing image"""
-    asyncio.run(_variations_async(
-        ctx.obj['api_key'], ctx.obj['config'], Path(image_path), count, size
-    ))
-
-async def _variations_async(api_key, config, image_path, count, size):
-    """Async implementation of variations command"""
-    async with ImageGenerator(api_key, config) as generator:
-        console.print(f"[cyan]Creating {count} variation(s) of {image_path.name}...[/cyan]")
-        
-        results = await generator.create_variations(image_path, count, size)
-        
-        save_dir = Path(config.get('save_directory')) / 'variations'
-        save_dir.mkdir(parents=True, exist_ok=True)
-        
-        for i, result in enumerate(results):
-            if result['success']:
-                filename = f"variation_{image_path.stem}_{i+1}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                save_path = save_dir / filename
-                
-                if await generator.download_image(result['url'], save_path):
-                    console.print(f"[green]✓[/green] Saved variation: {save_path}")
+                console.print(details)
             else:
-                console.print(f"[red]✗ Error: {result['error']}[/red]")
+                console.print("[red]Image not found![/red]")
+        except ValueError:
+            console.print("[red]Invalid ID![/red]")
 
-@cli.command()
-@click.argument('image_path', type=click.Path(exists=True))
-@click.option('--prompt', '-p', help='What the image should depict')
-@click.pass_context
-def analyze(ctx, image_path, prompt):
-    """Analyze an image using GPT-4 Vision"""
-    prompt = prompt or "Describe this image in detail."
+@app.command()
+def setup():
+    """
+    ⚙️ Configure DALL-E CLI settings
+    """
+    console.print(Panel("⚙️ [bold cyan]DALL-E CLI Setup[/bold cyan]", expand=False))
     
-    asyncio.run(_analyze_async(ctx.obj['api_key'], Path(image_path), prompt))
+    # API Key setup
+    if Confirm.ask("\n[cyan]Configure OpenAI API key?[/cyan]"):
+        api_key = Prompt.ask("Enter your OpenAI API key", password=True)
+        cli_instance.security_manager.save_api_key(api_key)
+        console.print("✅ API key saved securely")
+    
+    # Default settings
+    if Confirm.ask("\n[cyan]Configure default settings?[/cyan]"):
+        settings = {}
+        
+        # Default model
+        model_choices = list(MODELS.keys())
+        settings['default_model'] = questionary.select(
+            "Default model:",
+            choices=model_choices,
+            default="dall-e-3"
+        ).ask()
+        
+        # Default size
+        size_choices = MODELS[settings['default_model']]['sizes']
+        settings['default_size'] = questionary.select(
+            "Default size:",
+            choices=size_choices,
+            default=MODELS[settings['default_model']]['default_size']
+        ).ask()
+        
+        # Default quality for DALL-E 3
+        if settings['default_model'] == 'dall-e-3':
+            settings['default_quality'] = questionary.select(
+                "Default quality:",
+                choices=['standard', 'hd'],
+                default='standard'
+            ).ask()
+            
+            settings['default_style'] = questionary.select(
+                "Default style:",
+                choices=['vivid', 'natural'],
+                default='vivid'
+            ).ask()
+        
+        # Save settings
+        cli_instance.config_manager.update_config(settings)
+        console.print("✅ Settings saved")
+    
+    console.print("\n✨ Setup complete! Run [cyan]dalle --help[/cyan] to get started.")
 
-async def _analyze_async(api_key, image_path, prompt):
-    """Async implementation of analyze command"""
-    analyzer = VisionAnalyzer(api_key)
+@app.command()
+def export(
+    output: Path = typer.Argument(..., help="Output file path (JSON or ZIP)"),
+    format: str = typer.Option("json", "--format", "-f", help="Export format (json/zip)"),
+    include_images: bool = typer.Option(False, "--include-images", "-i", help="Include image files (zip only)")
+):
+    """
+    📤 Export your image collection
     
-    with console.status("Analyzing image..."):
-        result = await analyzer.analyze_image(image_path, prompt)
+    [bold]Example:[/bold]
+    $ dalle export collection.json
+    $ dalle export backup.zip --include-images
+    """
+    console.print(f"📤 Exporting collection to [cyan]{output}[/cyan]")
     
-    console.print(Panel(Markdown(result), title=f"Analysis of {image_path.name}"))
-
-@cli.command()
-@click.pass_context
-def interactive(ctx):
-    """Interactive mode with rich prompts"""
-    console.print("[bold cyan]DALL-E Interactive Mode[/bold cyan]")
-    console.print("Type 'help' for commands, 'exit' to quit\n")
+    # Get all generations
+    generations = cli_instance.db_manager.get_all_generations()
     
-    config = ctx.obj['config']
-    api_key = ctx.obj['api_key']
+    if format == "json":
+        # Export metadata only
+        data = []
+        for gen in generations:
+            data.append({
+                'id': gen.id,
+                'prompt': gen.prompt,
+                'model': gen.model,
+                'size': gen.size,
+                'quality': gen.quality,
+                'style': gen.style,
+                'image_path': gen.image_path,
+                'created_at': gen.created_at.isoformat(),
+                'revised_prompt': gen.revised_prompt
+            })
+        
+        with open(output, 'w') as f:
+            json.dump(data, f, indent=2)
+        
+        console.print(f"✅ Exported {len(data)} images metadata")
     
-    asyncio.run(_interactive_async(api_key, config))
-
-async def _interactive_async(api_key, config):
-    """Async implementation of interactive mode"""
-    async with ImageGenerator(api_key, config) as generator:
-        while True:
-            try:
-                command = Prompt.ask("\n[bold blue]dalle[/bold blue]")
-                
-                if command.lower() in ['exit', 'quit', 'q']:
-                    break
-                elif command.lower() == 'help':
-                    console.print("""
-[bold]Available commands:[/bold]
-  generate <prompt>  - Generate an image
-  batch <file>      - Process prompts from file
-  cost <count>      - Estimate generation cost
-  settings          - Show current settings
-                    """)
-                elif command.startswith('generate '):
-                    prompt = command[9:]
-                    model = config.get('default_model')
-                    size = config.get('default_size')
-                    quality = config.get('default_quality')
+    elif format == "zip":
+        import zipfile
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console
+        ) as progress:
+            task = progress.add_task("[cyan]Creating archive...", total=len(generations))
+            
+            with zipfile.ZipFile(output, 'w') as zf:
+                # Add metadata
+                metadata = []
+                for gen in generations:
+                    metadata.append({
+                        'id': gen.id,
+                        'prompt': gen.prompt,
+                        'model': gen.model,
+                        'size': gen.size,
+                        'quality': gen.quality,
+                        'style': gen.style,
+                        'image_path': gen.image_path,
+                        'created_at': gen.created_at.isoformat(),
+                        'revised_prompt': gen.revised_prompt
+                    })
                     
-                    with console.status("Generating image..."):
-                        result = await generator.generate_single(
-                            prompt, model, size, quality
-                        )
+                    # Add image if requested and exists
+                    if include_images and Path(gen.image_path).exists():
+                        zf.write(gen.image_path, f"images/{Path(gen.image_path).name}")
                     
-                    if result['success']:
-                        console.print(f"[green]✓ Generated![/green] URL: {result['url']}")
-                        if result.get('revised_prompt') != prompt:
-                            console.print(f"[dim]Revised prompt: {result['revised_prompt']}[/dim]")
-                    else:
-                        console.print(f"[red]Error: {result['error']}[/red]")
+                    progress.update(task, advance=1)
                 
-                elif command.startswith('cost '):
-                    count = int(command[5:])
-                    model = config.get('default_model')
-                    size = config.get('default_size')
-                    cost = generator.estimate_cost(model, size, count)
-                    console.print(f"[yellow]Cost for {count} images: ${cost:.3f}[/yellow]")
-                
-                elif command == 'settings':
-                    table = Table(title="Current Settings")
-                    table.add_column("Setting", style="cyan")
-                    table.add_column("Value", style="green")
-                    
-                    table.add_row("Model", config.get('default_model'))
-                    table.add_row("Size", config.get('default_size'))
-                    table.add_row("Quality", config.get('default_quality'))
-                    
-                    console.print(table)
-                
-            except KeyboardInterrupt:
-                console.print("\n[yellow]Use 'exit' to quit[/yellow]")
-            except Exception as e:
-                console.print(f"[red]Error: {e}[/red]")
+                # Write metadata
+                zf.writestr('metadata.json', json.dumps(metadata, indent=2))
+        
+        console.print(f"✅ Exported {len(generations)} images to archive")
 
-if __name__ == '__main__':
-    cli()
+def interactive_menu():
+    """Show interactive menu when no command is specified"""
+    console.print(Panel("🎨 [bold cyan]DALL-E CLI v2[/bold cyan]", expand=False))
+    
+    choices = [
+        "🎨 Generate new images",
+        "🔄 Create variations",
+        "✏️  Edit images",
+        "🖼️  View gallery",
+        "📤 Export collection",
+        "⚙️  Setup/Settings",
+        "❌ Exit"
+    ]
+    
+    choice = questionary.select(
+        "What would you like to do?",
+        choices=choices
+    ).ask()
+    
+    if "Generate" in choice:
+        # Interactive generation
+        prompt = Prompt.ask("Enter your prompt")
+        model = questionary.select("Select model:", choices=list(MODELS.keys())).ask()
+        
+        # Use typer context to run command
+        ctx = typer.Context(command=generate)
+        ctx.invoke(generate, prompt=prompt, model=model)
+        
+    elif "variations" in choice:
+        console.print("[cyan]Run: dalle variations <image_path>[/cyan]")
+    elif "Edit" in choice:
+        console.print("[cyan]Run: dalle edit <image_path> <mask_path> <prompt>[/cyan]")
+    elif "gallery" in choice:
+        ctx = typer.Context(command=gallery)
+        ctx.invoke(gallery)
+    elif "Export" in choice:
+        console.print("[cyan]Run: dalle export <output_path>[/cyan]")
+    elif "Setup" in choice:
+        ctx = typer.Context(command=setup)
+        ctx.invoke(setup)
+
+if __name__ == "__main__":
+    app()

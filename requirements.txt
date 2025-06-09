@@ -5,3 +5,8 @@ Pillow
 python-dotenv
 cryptography
 numpy
+typer[all]
+rich
+questionary
+httpx
+aiofiles
