@@ -1,0 +1,8 @@
+openai
+aiohttp
+Pillow
+python-dotenv
+cryptography
+rich
+questionary
+click

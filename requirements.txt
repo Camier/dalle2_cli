@@ -1,0 +1,7 @@
+customtkinter
+openai
+aiohttp
+Pillow
+python-dotenv
+cryptography
+numpy

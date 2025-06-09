@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DALL-E Mobile</title>
+    <link rel="manifest" href="/static/manifest.json">
+    <meta name="theme-color" content="#2196F3">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f0f0f0;
+            color: #333;
+        }
+        
+        .container {
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        h1 {
+            text-align: center;
+            color: #2196F3;
+            margin-bottom: 30px;
+        }
+        
+        .input-group {
+            margin-bottom: 20px;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: 600;
+        }
+        
+        input, textarea, select {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-size: 16px;
+        }
+        
+        textarea {
+            resize: vertical;
+            min-height: 100px;
+        }
+        
+        button {
+            width: 100%;
+            padding: 15px;
+            background: #2196F3;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 18px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+        
+        button:hover {
+            background: #1976D2;
+        }
+        
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        
+        .loading {
+            display: none;
+            text-align: center;
+            margin: 20px 0;
+        }
+        
+        .spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #2196F3;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .result {
+            margin-top: 30px;
+            text-align: center;
+        }
+        
+        .result img {
+            max-width: 100%;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        
+        .download-btn {
+            display: inline-block;
+            margin-top: 15px;
+            padding: 10px 20px;
+            background: #4CAF50;
+            color: white;
+            text-decoration: none;
+            border-radius: 5px;
+        }
+        
+        .error {
+            color: #f44336;
+            margin-top: 10px;
+            padding: 10px;
+            background: #ffebee;
+            border-radius: 5px;
+            display: none;
+        }
+        
+        .api-key-hint {
+            font-size: 12px;
+            color: #666;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎨 DALL-E Mobile</h1>
+        
+        <div class="input-group">
+            <label for="api-key">OpenAI API Key</label>
+            <input type="password" id="api-key" placeholder="sk-..." />
+            <div class="api-key-hint">
+                Get your key from <a href="https://platform.openai.com/api-keys" target="_blank">OpenAI</a>
+            </div>
+        </div>
+        
+        <div class="input-group">
+            <label for="model">Model</label>
+            <select id="model">
+                <option value="dall-e-2">DALL-E 2 (Faster, Cheaper)</option>
+                <option value="dall-e-3">DALL-E 3 (Better Quality)</option>
+            </select>
+        </div>
+        
+        <div class="input-group">
+            <label for="prompt">Describe your image</label>
+            <textarea id="prompt" placeholder="A futuristic city with flying cars..."></textarea>
+        </div>
+        
+        <button id="generate-btn" onclick="generateImage()">Generate Image</button>
+        
+        <div class="loading">
+            <div class="spinner"></div>
+            <p>Generating your image...</p>
+        </div>
+        
+        <div class="error" id="error"></div>
+        
+        <div class="result" id="result"></div>
+    </div>
+    
+    <script>
+        // Save API key to localStorage
+        const apiKeyInput = document.getElementById('api-key');
+        apiKeyInput.value = localStorage.getItem('dalle_api_key') || '';
+        apiKeyInput.addEventListener('change', () => {
+            localStorage.setItem('dalle_api_key', apiKeyInput.value);
+        });
+        
+        async function generateImage() {
+            const apiKey = document.getElementById('api-key').value;
+            const model = document.getElementById('model').value;
+            const prompt = document.getElementById('prompt').value;
+            
+            if (!apiKey || !prompt) {
+                showError('Please enter both API key and prompt');
+                return;
+            }
+            
+            const button = document.getElementById('generate-btn');
+            const loading = document.querySelector('.loading');
+            const result = document.getElementById('result');
+            const error = document.getElementById('error');
+            
+            // Reset UI
+            button.disabled = true;
+            loading.style.display = 'block';
+            result.innerHTML = '';
+            error.style.display = 'none';
+            
+            try {
+                const response = await fetch('/generate', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        api_key: apiKey,
+                        prompt: prompt,
+                        model: model
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    result.innerHTML = ;
+                } else {
+                    showError(data.error || 'Failed to generate image');
+                }
+            } catch (err) {
+                showError('Network error: ' + err.message);
+            } finally {
+                button.disabled = false;
+                loading.style.display = 'none';
+            }
+        }
+        
+        function showError(message) {
+            const error = document.getElementById('error');
+            error.textContent = message;
+            error.style.display = 'block';
+        }
+        
+        // PWA Service Worker
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('/static/sw.js');
+        }
+    </script>
+</body>
+</html>
